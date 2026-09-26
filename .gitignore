@@ -1,0 +1,25 @@
+# Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual env
+venv/
+env/
+.venv/
+
+# Runtime database
+data/
+*.db
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+smoke_output.txt
+
+# Logs
+*.log

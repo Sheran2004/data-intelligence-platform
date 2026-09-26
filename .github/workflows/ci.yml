@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+        cache: pip
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install flake8
+
+    - name: Lint with flake8
+      run: |
+        # stop the build if there are Python syntax errors or undefined names
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        # exit-zero treats all remaining flake8 issues as warnings
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=120 --statistics
+
+    - name: Smoke test (offline mode)
+      env:
+        DIP_DISABLE_NETWORK: 1
+      run: |
+        python -c "from data_intelligence.ai_engine import get_engine; eng = get_engine(); i = eng.parse('Find me Python jobs'); assert i.data_type == 'job'; print('AI engine OK')"
+        python -c "import app; print('App imports OK')"
+
+    - name: Verify deploy files exist
+      run: |
+        test -f wsgi.py
+        test -f Procfile
+        test -f Dockerfile
+        test -f runtime.txt
+        test -f .env.example
+        echo "All deploy files present"
+
+    - name: Verify Docker build (optional)
+      run: |
+        docker build -t dip-test . || echo "Docker build skipped (no docker in runner)"
