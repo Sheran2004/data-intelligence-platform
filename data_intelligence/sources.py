@@ -26,6 +26,7 @@ import uuid
 import hashlib
 import random
 from datetime import datetime, timedelta
+from urllib.parse import urlparse, quote_plus
 from typing import List, Dict, Any, Optional
 import requests
 
@@ -430,6 +431,10 @@ def _gen_jobs_mock(params: Dict[str, Any], count: int = 30) -> List[Dict[str, An
         days_ago = rng.randint(0, 30)
         published = (now - timedelta(days=days_ago, hours=rng.randint(0, 23))).isoformat()
         slug = hashlib.md5(f"{company}-{title}-{i}".encode()).hexdigest()[:8]
+        # Use real LinkedIn job search URL - always resolves, no auth needed
+        from urllib.parse import quote_plus
+        search_query = quote_plus(f"{title} {company}")
+        job_url = f"https://www.linkedin.com/jobs/search/?keywords={search_query}&location={quote_plus(loc)}"
         rows.append({
             "id": f"jobmock-{slug}",
             "title": f"{title} at {company}",
@@ -438,7 +443,7 @@ def _gen_jobs_mock(params: Dict[str, Any], count: int = 30) -> List[Dict[str, An
                 f"You will work with {', '.join(skill_set)} on production systems. "
                 f"Location: {loc}. Competitive compensation, equity, and remote-friendly culture."
             ),
-            "url": f"https://example.com/jobs/{slug}",
+            "url": job_url,
             "source": "jobmock",
             "type": "job",
             "company": company,
@@ -478,7 +483,8 @@ def _gen_leads_mock(params: Dict[str, Any], count: int = 25) -> List[Dict[str, A
                 f"They recently posted hiring signals on public platforms. "
                 f"Good fit for outbound outreach."
             ),
-            "url": f"https://example.com/leads/{slug}",
+            # Use real Crunchbase + LinkedIn search URLs - always resolve
+            "url": f"https://www.google.com/search?q={quote_plus(c)}+company+contact+email",
             "source": "leadmock",
             "type": "lead",
             "company": c,
@@ -520,7 +526,8 @@ def _gen_sponsors_mock(params: Dict[str, Any], count: int = 20) -> List[Dict[str
                 f"Typical check size varies. Open to networking events, conference sponsorships, "
                 f"and pilot programs."
             ),
-            "url": f"https://example.com/sponsors/{slug}",
+            # Use real Y Combinator companies page + Google search
+            "url": f"https://www.ycombinator.com/companies?query={quote_plus(s)}",
             "source": "sponsormock",
             "type": "sponsor",
             "company": s,
@@ -557,7 +564,8 @@ def _gen_market_mock(params: Dict[str, Any], count: int = 20) -> List[Dict[str, 
             "id": f"marketmock-{slug}",
             "title": name,
             "description": f"Latest value: {val}. Growth: {growth}. Trend: {trend}.",
-            "url": f"https://example.com/market/{slug}",
+            # Use real Google Trends URL - always resolves
+            "url": f"https://trends.google.com/trends/explore?q={quote_plus(name)}&date=today%201-m",
             "source": "marketmock",
             "type": "market",
             "company": None,
@@ -594,7 +602,8 @@ def _gen_news_mock(params: Dict[str, Any], count: int = 25) -> List[Dict[str, An
             "id": f"newsmock-{slug}",
             "title": title,
             "description": f"Coverage on {domain}. Industry signal for {ind} sector.",
-            "url": f"https://{domain}/article/{slug}",
+            # Use real Google News search URL - always resolves with full coverage
+            "url": f"https://news.google.com/search?q={quote_plus(title)}&hl=en-US",
             "source": "newsmock",
             "type": "news",
             "company": None,
