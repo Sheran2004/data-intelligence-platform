@@ -1,0 +1,1326 @@
+/* AI Data Intelligence Platform - frontend logic
+ * v3 - full wiring (history search, status tabs, clear, ab-test, watchlist,
+ *      notifications, bulk-export, replay-diff, quality, source explorer,
+ *      delete-on-sidebar, keyboard shortcuts).
+ */
+
+const API = {
+  preview: '/api/preview',
+  runs: '/api/runs',
+  run: id => `/api/runs/${id}`,
+  live: id => `/api/runs/${id}/live`,
+  records: id => `/api/runs/${id}/records`,
+  export: (id, fmt) => `/api/runs/${id}/export?format=${fmt}`,
+  bulkExport: '/api/bulk-export',
+  stats: '/api/stats',
+  demo: '/api/demo/load',
+  summary: id => `/api/runs/${id}/summary`,
+  sourceHealth: id => `/api/runs/${id}/source-health`,
+  sourceHealthAll: '/api/source-health',
+  runSources: id => `/api/runs/${id}/sources`,
+  replay: id => `/api/runs/${id}/replay`,
+  replayDiff: id => `/api/runs/${id}/replay-diff`,
+  quality: id => `/api/runs/${id}/quality`,
+  schedules: '/api/schedules',
+  schedule: id => `/api/schedules/${id}`,
+  scheduleToggle: id => `/api/schedules/${id}/toggle`,
+  webhooks: '/api/webhooks',
+  webhook: id => `/api/webhooks/${id}`,
+  share: id => `/api/runs/${id}/share`,
+  shareView: token => `/api/share/${token}`,
+  compare: '/api/runs/compare',
+  abTest: '/api/ab-test',
+  watchlist: '/api/watchlist',
+  watchlistItem: id => `/api/watchlist/${id}`,
+  notifications: '/api/notifications',
+  notificationItem: id => `/api/notifications/${id}`,
+};
+
+const state = {
+  currentRunId: null,
+  run: null,
+  records: [],
+  pollHandle: null,
+  searchDebounce: null,
+  theme: localStorage.getItem('dip_theme') || 'dark',
+  historyFilter: 'all',
+  historyQuery: '',
+  watchlist: [],
+  notifications: [],
+};
+
+/* =========================== Utilities =========================== */
+
+function $(sel, root = document) { return root.querySelector(sel); }
+function $$(sel, root = document) { return Array.from(root.querySelectorAll(sel)); }
+
+function escapeHtml(str) {
+  if (str == null) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function timeAgo(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  const diff = (Date.now() - d.getTime()) / 1000;
+  if (diff < 60) return 'just now';
+  if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+  if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+  if (diff < 86400 * 30) return Math.floor(diff / 86400) + 'd ago';
+  return d.toLocaleDateString();
+}
+
+function toast(msg, kind = 'info') {
+  const host = $('#toast-host') || (() => {
+    const h = document.createElement('div');
+    h.id = 'toast-host';
+    h.className = 'toast-host';
+    document.body.appendChild(h);
+    return h;
+  })();
+  const el = document.createElement('div');
+  el.className = `toast ${kind}`;
+  el.textContent = msg;
+  host.appendChild(el);
+  setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity .3s'; }, 2400);
+  setTimeout(() => el.remove(), 2800);
+}
+
+function fetchJSON(url, opts = {}) {
+  return fetch(url, {
+    headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
+    ...opts,
+  }).then(r => {
+    if (!r.ok) {
+      return r.json().catch(() => ({})).then(j => {
+        throw new Error((j && j.error) || `${r.status} ${r.statusText}`);
+      });
+    }
+    return r.json();
+  });
+}
+
+function safeOn(sel, evt, fn) {
+  const el = $(sel);
+  if (el) el.addEventListener(evt, fn);
+  return el;
+}
+
+function safeOnAll(sel, evt, fn) {
+  $$(sel).forEach(el => el.addEventListener(evt, fn));
+}
+
+/* =========================== Theme =========================== */
+
+function applyTheme(t) {
+  document.documentElement.setAttribute('data-theme', t);
+  const btn = $('#theme-toggle');
+  if (btn) btn.textContent = t === 'dark' ? '🌙' : '☀️';
+  state.theme = t;
+  localStorage.setItem('dip_theme', t);
+}
+
+function toggleTheme() {
+  applyTheme(state.theme === 'dark' ? 'light' : 'dark');
+  if (state.records.length && state.currentRunId) renderCharts(state.records);
+}
+
+/* =========================== Modal helpers =========================== */
+
+function openModal(id = 'modal') {
+  const m = $('#' + id);
+  if (!m) return;
+  m.hidden = false;
+  if (id === 'modal') {
+    $('#modal-preview').hidden = true;
+    if (!$('#modal-prompt').value) {
+      $('#modal-prompt').value = $('#empty-prompt').value || '';
+    }
+    setTimeout(() => $('#modal-prompt').focus(), 50);
+  }
+}
+
+function closeModal(id) {
+  if (id) {
+    const m = $('#' + id);
+    if (m) m.hidden = true;
+  } else {
+    $('#modal').hidden = true;
+  }
+}
+
+function closeModalById(id) { $('#' + id).hidden = true; }
+
+function previewPrompt(prompt, targetEl) {
+  if (!prompt || !prompt.trim()) {
+    toast('Please enter a prompt first', 'error');
+    return;
+  }
+  fetchJSON(API.preview, { method: 'POST', body: JSON.stringify({ prompt }) })
+    .then(({ intent }) => {
+      targetEl.hidden = false;
+      targetEl.textContent = JSON.stringify(intent, null, 2);
+    })
+    .catch(err => toast(err.message, 'error'));
+}
+
+function launchFromModal() {
+  const prompt = $('#modal-prompt').value.trim();
+  if (!prompt) { toast('Please enter a prompt', 'error'); return; }
+  closeModal('modal');
+  startRun(prompt);
+}
+
+function launchFromEmpty() {
+  const prompt = $('#empty-prompt').value.trim();
+  if (!prompt) { toast('Please enter a prompt', 'error'); return; }
+  startRun(prompt);
+}
+
+/* =========================== Voice =========================== */
+
+function setupVoice(btnSel, inputSel) {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) {
+    const btn = $(btnSel);
+    if (btn) btn.style.display = 'none';
+    return;
+  }
+  const btn = $(btnSel);
+  const input = $(inputSel);
+  if (!btn || !input) return;
+
+  const recognition = new SR();
+  recognition.continuous = false;
+  recognition.interimResults = true;
+  recognition.lang = 'en-US';
+
+  btn.addEventListener('click', () => {
+    if (btn.classList.contains('listening')) {
+      recognition.stop();
+      return;
+    }
+    try {
+      recognition.start();
+      btn.classList.add('listening');
+      toast('Listening… speak now', 'success');
+    } catch (e) {
+      toast('Voice not available: ' + e.message, 'error');
+    }
+  });
+
+  recognition.onresult = (e) => {
+    const text = Array.from(e.results).map(r => r[0].transcript).join('');
+    input.value = text;
+  };
+  recognition.onerror = (e) => {
+    btn.classList.remove('listening');
+    toast('Voice error: ' + e.error, 'error');
+  };
+  recognition.onend = () => btn.classList.remove('listening');
+}
+
+/* =========================== Bootstrap =========================== */
+
+document.addEventListener('DOMContentLoaded', () => {
+  applyTheme(state.theme);
+
+  /* ---------- Topbar ---------- */
+  safeOn('#theme-toggle', 'click', toggleTheme);
+  safeOn('#btn-watchlist', 'click', openWatchlistModal);
+  safeOn('#btn-notifications', 'click', openNotificationsModal);
+  safeOn('#btn-bulk-export', 'click', openBulkExportModal);
+  safeOn('#btn-analytics', 'click', openAnalyticsModal);
+
+  /* ---------- Sidebar: New / Demo / AB-Test ---------- */
+  safeOn('#btn-new-run', 'click', () => openModal('modal'));
+  safeOn('#btn-load-demo', 'click', loadDemo);
+  safeOn('#btn-ab-test', 'click', openAbTestModal);
+
+  /* ---------- Sidebar: history search + tabs + clear ---------- */
+  safeOn('#history-search', 'input', e => {
+    state.historyQuery = e.target.value.toLowerCase();
+    renderRunList(getCachedRuns());
+  });
+  safeOnAll('.history-tab', 'click', e => {
+    state.historyFilter = e.currentTarget.dataset.filter || 'all';
+    $$('.history-tab').forEach(t => t.classList.toggle('active', t === e.currentTarget));
+    renderRunList(getCachedRuns());
+  });
+  safeOn('#btn-clear-history', 'click', clearHistory);
+
+  /* ---------- Run-view action buttons ---------- */
+  safeOn('#btn-export-json', 'click', () => exportRun('json'));
+  safeOn('#btn-export-csv', 'click', () => exportRun('csv'));
+  safeOn('#btn-replay', 'click', replayRun);
+  safeOn('#btn-replay-diff', 'click', openReplayDiffModal);
+  safeOn('#btn-share', 'click', shareRun);
+  safeOn('#btn-compare', 'click', openCompareModal);
+  safeOn('#btn-quality', 'click', openQualityModal);
+  safeOn('#btn-explore-sources', 'click', openSourcesModal);
+  safeOn('#btn-delete', 'click', deleteRun);
+
+  /* ---------- Modals: schedule + webhook ---------- */
+  safeOn('#btn-new-schedule', 'click', () => $('#schedule-modal').hidden = false);
+  safeOn('#btn-schedule-save', 'click', saveSchedule);
+  safeOn('#btn-new-webhook', 'click', () => $('#webhook-modal').hidden = false);
+  safeOn('#btn-webhook-save', 'click', saveWebhook);
+
+  /* ---------- Modals: ab-test / replay-diff / bulk export / watchlist / notifications ---------- */
+  safeOn('#btn-run-ab', 'click', runAbTest);
+  safeOn('#btn-run-replay-diff', 'click', runReplayDiff);
+  safeOn('#btn-bulk-go', 'click', runBulkExport);
+
+  /* ---------- Modal: prompt + voice + example chips ---------- */
+  safeOn('#modal-close', 'click', () => closeModal('modal'));
+  safeOn('#modal', 'click', e => { if (e.target.id === 'modal') closeModal('modal'); });
+  safeOnAll('[data-close]', 'click', e => closeModalById(e.currentTarget.dataset.close));
+  safeOn('#btn-modal-preview', 'click', () => previewPrompt($('#modal-prompt').value, $('#modal-preview')));
+  safeOn('#btn-modal-launch', 'click', launchFromModal);
+
+  safeOn('#btn-empty-launch', 'click', launchFromEmpty);
+  safeOn('#btn-empty-preview', 'click', () => previewPrompt($('#empty-prompt').value, $('#empty-preview')));
+  safeOn('#btn-empty-load-demo', 'click', loadDemo);
+
+  safeOnAll('.example-chip', 'click', e => {
+    const prompt = e.currentTarget.getAttribute('data-prompt');
+    $('#modal-prompt').value = prompt;
+    openModal('modal');
+  });
+
+  setupVoice('#btn-voice-empty', '#empty-prompt');
+  setupVoice('#btn-voice-modal', '#modal-prompt');
+
+  /* ---------- Filters ---------- */
+  safeOn('#search-input', 'input', () => {
+    clearTimeout(state.searchDebounce);
+    state.searchDebounce = setTimeout(refreshRecords, 200);
+  });
+  safeOn('#source-filter', 'change', refreshRecords);
+  safeOn('#score-filter', 'change', refreshRecords);
+  safeOn('#sort-select', 'change', refreshRecords);
+
+  /* ---------- Keyboard shortcuts ---------- */
+  document.addEventListener('keydown', e => {
+    if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.isContentEditable)) {
+      if (e.key === 'Escape') e.target.blur();
+      return;
+    }
+    if (e.key === '/') { e.preventDefault(); const s = $('#history-search'); if (s) s.focus(); }
+    else if (e.key === 'n' || e.key === 'N') { openModal('modal'); }
+    else if (e.key === 'd' || e.key === 'D') { loadDemo(); }
+    else if (e.key === 't' || e.key === 'T') { toggleTheme(); }
+    else if (e.key === 'b' || e.key === 'B') { openAbTestModal(); }
+    else if (e.key === 'Escape') {
+      $$('.modal').forEach(m => { m.hidden = true; });
+    }
+  });
+
+  refreshStats();
+  refreshRuns();
+  refreshSchedules();
+  refreshWebhooks();
+  refreshNotifications();
+  refreshWatchlist();
+});
+
+/* =========================== Demo =========================== */
+
+function loadDemo() {
+  fetchJSON(API.demo, { method: 'POST' })
+    .then(({ seeded, count }) => {
+      toast(`Loaded ${count} demo runs`, 'success');
+      refreshRuns();
+      refreshStats();
+      if (seeded && seeded.length) selectRun(seeded[0]);
+    })
+    .catch(err => toast(err.message, 'error'));
+}
+
+/* =========================== Runs =========================== */
+
+let cachedRuns = [];
+function getCachedRuns() { return cachedRuns; }
+
+function startRun(prompt) {
+  fetchJSON(API.runs, { method: 'POST', body: JSON.stringify({ prompt }) })
+    .then(({ run_id }) => {
+      state.currentRunId = run_id;
+      $('#empty-state').hidden = true;
+      $('#run-view').hidden = false;
+      $('#run-id').textContent = `run-${run_id}`;
+      $('#run-prompt').textContent = prompt;
+      $('#empty-prompt').value = '';
+      $('#records').innerHTML = '<div class="results-loading"><div class="spinner"></div><div>Starting workflow…</div></div>';
+      $('#run-status-bar').hidden = false;
+      $('#status-pill').className = 'status-pill';
+      $('#status-pill').textContent = 'queued';
+      $('#status-text').textContent = 'Initializing…';
+      $('#summary-card').hidden = true;
+      $('#charts-card').hidden = true;
+      $('#health-card').hidden = true;
+      toast('Workflow started', 'success');
+      refreshRuns();
+      pollRun(run_id);
+    })
+    .catch(err => toast(err.message, 'error'));
+}
+
+function replayRun() {
+  if (!state.currentRunId) return;
+  fetchJSON(API.replay(state.currentRunId), { method: 'POST' })
+    .then(({ run_id }) => {
+      state.currentRunId = run_id;
+      $('#run-id').textContent = `run-${run_id}`;
+      $('#records').innerHTML = '<div class="results-loading"><div class="spinner"></div><div>Replaying workflow…</div></div>';
+      toast('Replay started', 'success');
+      refreshRuns();
+      pollRun(run_id);
+    })
+    .catch(err => toast(err.message, 'error'));
+}
+
+function deleteRun() {
+  if (!state.currentRunId) return;
+  if (!confirm('Delete this run and its dataset?')) return;
+  fetchJSON(API.run(state.currentRunId), { method: 'DELETE' })
+    .then(() => {
+      toast('Run deleted', 'success');
+      state.currentRunId = null;
+      state.records = [];
+      state.run = null;
+      $('#run-view').hidden = true;
+      $('#empty-state').hidden = false;
+      refreshRuns();
+      refreshStats();
+    })
+    .catch(err => toast(err.message, 'error'));
+}
+
+function deleteRunById(id, event) {
+  if (event) event.stopPropagation();
+  if (!confirm('Delete this run?')) return;
+  fetchJSON(API.run(id), { method: 'DELETE' })
+    .then(() => {
+      toast('Run deleted', 'success');
+      if (state.currentRunId === id) {
+        state.currentRunId = null;
+        state.run = null;
+        $('#run-view').hidden = true;
+        $('#empty-state').hidden = false;
+      }
+      refreshRuns();
+      refreshStats();
+    })
+    .catch(err => toast(err.message, 'error'));
+}
+
+function clearHistory() {
+  if (!confirm('Delete ALL runs? This cannot be undone.')) return;
+  fetchJSON(API.runs, { method: 'DELETE' })
+    .then(({ deleted }) => {
+      toast(`Cleared ${deleted || 0} runs`, 'success');
+      state.currentRunId = null;
+      state.run = null;
+      state.records = [];
+      $('#run-view').hidden = true;
+      $('#empty-state').hidden = false;
+      cachedRuns = [];
+      renderRunList(cachedRuns);
+      refreshStats();
+    })
+    .catch(err => toast(err.message, 'error'));
+}
+
+function exportRun(fmt) {
+  if (!state.currentRunId) return;
+  window.location.href = API.export(state.currentRunId, fmt);
+}
+
+function shareRun() {
+  if (!state.currentRunId) return;
+  fetchJSON(API.share(state.currentRunId), { method: 'POST' })
+    .then(({ token, url }) => {
+      const fullUrl = `${window.location.origin}${url}`;
+      if (navigator.clipboard) navigator.clipboard.writeText(fullUrl).catch(() => {});
+      toast('Share link copied to clipboard!', 'success');
+      prompt('Share this public read-only link:', fullUrl);
+    })
+    .catch(err => toast(err.message, 'error'));
+}
+
+function refreshRuns() {
+  fetchJSON(API.runs)
+    .then(({ runs }) => {
+      cachedRuns = runs || [];
+      renderRunList(cachedRuns);
+    })
+    .catch(err => toast(err.message, 'error'));
+}
+
+function renderRunList(runs) {
+  const list = $('#run-list');
+  if (!list) return;
+
+  let filtered = runs;
+  if (state.historyFilter && state.historyFilter !== 'all') {
+    filtered = filtered.filter(r => (r.status || '').toLowerCase() === state.historyFilter);
+  }
+  if (state.historyQuery) {
+    filtered = filtered.filter(r => (r.prompt || '').toLowerCase().includes(state.historyQuery));
+  }
+
+  if (!filtered.length) {
+    list.innerHTML = '<li style="background:transparent;border:none;color:var(--text-mute);padding:8px;font-style:italic;">No runs match</li>';
+    return;
+  }
+
+  list.innerHTML = filtered.map(r => `
+    <li class="${r.id === state.currentRunId ? 'active' : ''}" data-id="${r.id}">
+      <button class="rl-del" data-del="${r.id}" title="Delete this run">×</button>
+      <div class="rl-prompt">${escapeHtml(r.prompt)}</div>
+      <div class="rl-meta">
+        <span><span class="status-dot ${escapeHtml(r.status)}"></span> ${escapeHtml(r.status)}</span>
+        <span>${r.total_records} rec · ${timeAgo(new Date(r.created_at * 1000).toISOString())}</span>
+      </div>
+    </li>
+  `).join('');
+
+  $$('#run-list li[data-id]').forEach(li => {
+    li.addEventListener('click', e => {
+      if (e.target.closest('[data-del]')) return;
+      selectRun(li.dataset.id);
+    });
+  });
+  $$('#run-list [data-del]').forEach(btn => {
+    btn.addEventListener('click', e => deleteRunById(btn.dataset.del, e));
+  });
+}
+
+function selectRun(id) {
+  state.currentRunId = id;
+  $('#empty-state').hidden = true;
+  $('#run-view').hidden = false;
+  renderRunList(cachedRuns);
+  fetchJSON(API.live(id))
+    .then(({ run, live }) => {
+      applyRun(run);
+      loadRunExtras(id);
+      if (!live && run.status !== 'running') {
+        refreshRecords();
+      } else {
+        pollRun(id);
+      }
+    })
+    .catch(() => {
+      $('#empty-state').hidden = false;
+      $('#run-view').hidden = true;
+      toast('Run not found', 'error');
+    });
+}
+
+function refreshStats() {
+  fetchJSON(API.stats)
+    .then(s => {
+      const sr = $('#stat-runs'); if (sr) sr.textContent = s.runs || 0;
+      const srec = $('#stat-records'); if (srec) srec.textContent = s.records || 0;
+      const st = $('#stat-types'); if (st) st.textContent = Object.keys(s.by_type || {}).length;
+    })
+    .catch(() => {});
+}
+
+/* =========================== Polling live =========================== */
+
+function pollRun(runId) {
+  clearInterval(state.pollHandle);
+  let sidebarTick = 0;
+  const tick = () => {
+    fetchJSON(API.live(runId))
+      .then(({ run, live }) => {
+        applyRun(run);
+        if (run.status !== 'running') {
+          clearInterval(state.pollHandle);
+          refreshRuns();
+          refreshRecords();
+          refreshStats();
+          loadRunExtras(runId);
+          toast(`Workflow ${run.status}`, run.status === 'done' ? 'success' : 'error');
+          return;
+        }
+        sidebarTick = (sidebarTick + 1) % 3;
+        if (sidebarTick === 0) refreshRuns();
+      })
+      .catch(() => clearInterval(state.pollHandle));
+  };
+  state.pollHandle = setInterval(tick, 1000);
+  tick();
+}
+
+function applyRun(run) {
+  state.run = run;
+  $('#run-id').textContent = `run-${run.id}`;
+  $('#run-prompt').textContent = run.prompt;
+
+  const pill = $('#status-pill');
+  pill.className = 'status-pill ' + (run.status || '');
+  pill.textContent = run.status;
+  $('#status-text').textContent = run.status === 'running'
+    ? 'Workflow is running…'
+    : run.status === 'failed'
+      ? (run.error || 'Workflow failed')
+      : `${(run.workflow || {}).total_records || 0} record(s) collected`;
+
+  renderSteps(run.workflow);
+  renderIntent(run.intent);
+  renderHealth(run.workflow);
+
+  if (run.status === 'running' && Array.isArray(run.records)) {
+    $('#records').innerHTML = '<div class="results-loading"><div class="spinner"></div><div>Collecting…</div></div>';
+  }
+}
+
+/* =========================== Run extras =========================== */
+
+function loadRunExtras(runId) {
+  if (!runId) return;
+  fetchJSON(API.summary(runId))
+    .then(({ summary }) => renderSummary(summary))
+    .catch(() => {});
+}
+
+function renderSummary(summary) {
+  if (!summary) return;
+  $('#summary-card').hidden = false;
+  $('#summary-body').innerHTML = summary.narrative || '';
+  const insights = summary.insights || [];
+  $('#summary-insights').innerHTML = insights.map(i => `
+    <div class="insight">
+      <div class="insight-label">${escapeHtml(i.label)}</div>
+      <div class="insight-value">${escapeHtml(i.value)}</div>
+    </div>
+  `).join('');
+}
+
+function renderSteps(workflow) {
+  const steps = (workflow && workflow.steps) || [];
+  $('#steps').innerHTML = steps.map(s => `
+    <div class="step ${escapeHtml(s.status)}">
+      <div class="step-icon">${
+        s.status === 'done' ? '✓' :
+        s.status === 'failed' ? '✕' :
+        s.status === 'running' ? '⟳' : '·'
+      }</div>
+      <div>
+        <div class="step-name">${escapeHtml(s.name)}</div>
+        <div class="step-meta">${escapeHtml(s.message || '')} ${s.records_out ? '· ' + s.records_out + ' rec' : ''} ${s.latency_ms ? '· ' + s.latency_ms + 'ms' : ''}</div>
+      </div>
+      ${s.source ? `<div class="step-source">${escapeHtml(s.source)}</div>` : ''}
+    </div>
+  `).join('');
+}
+
+function renderIntent(intent) {
+  if (!intent) { $('#intent-grid').innerHTML = ''; return; }
+  const items = [
+    { label: 'Data type', val: intent.data_type },
+    { label: 'Skills', val: intent.skills || [], kind: 'pills-accent' },
+    { label: 'Locations', val: intent.locations || [], kind: 'pills' },
+    { label: 'Industries', val: intent.industries || [], kind: 'pills' },
+    { label: 'Company size', val: intent.company_sizes || [], kind: 'pills' },
+    { label: 'Time window', val: intent.time_window_hours ? `${intent.time_window_hours}h` : '—' },
+    { label: 'Freshness', val: intent.freshness || 'any' },
+    { label: 'Max results', val: intent.max_results },
+  ];
+  $('#intent-grid').innerHTML = items.map(i => `
+    <div class="intent-item">
+      <label>${escapeHtml(i.label)}</label>
+      ${Array.isArray(i.val)
+        ? `<div class="val-pills">${i.val.length ? i.val.map(v => `<span class="pill ${i.kind === 'pills-accent' ? 'accent' : ''}">${escapeHtml(v)}</span>`).join('') : '<span style="color:var(--text-mute)">—</span>'}</div>`
+        : `<div class="val">${escapeHtml(String(i.val || '—'))}</div>`
+      }
+    </div>
+  `).join('');
+}
+
+function renderHealth(workflow) {
+  const steps = (workflow && workflow.steps) || [];
+  const collectSteps = steps.filter(s => s.type === 'collect');
+  if (!collectSteps.length) { $('#health-card').hidden = true; return; }
+  $('#health-card').hidden = false;
+  $('#health-grid').innerHTML = collectSteps.map(s => {
+    let cls = 'good';
+    if (s.status === 'failed' || s.status === 'fail') cls = 'bad';
+    else if (s.latency_ms > 8000) cls = 'warn';
+    return `
+      <div class="health-item">
+        <div class="health-dot ${cls}"></div>
+        <div class="health-name">${escapeHtml(s.source || 'unknown')}</div>
+        <div class="health-time">${s.latency_ms ? s.latency_ms + 'ms' : '-'}</div>
+      </div>
+    `;
+  }).join('');
+}
+
+/* =========================== Charts (SVG) =========================== */
+
+function renderCharts(records) {
+  if (!records || !records.length) { $('#charts-card').hidden = true; return; }
+  $('#charts-card').hidden = false;
+
+  const isDark = state.theme === 'dark';
+  const textColor = isDark ? '#a3acd9' : '#4b5575';
+  const gridColor = isDark ? '#232c52' : '#e6eaf5';
+  const palette = ['#7c5cff', '#5cc8ff', '#ff7ac6', '#36d399', '#fbbd23', '#f87171', '#a78bfa', '#34d399'];
+
+  // Source distribution (donut)
+  const srcCounts = {};
+  records.forEach(r => { const s = r.source || 'unknown'; srcCounts[s] = (srcCounts[s] || 0) + 1; });
+  const srcTotal = Object.values(srcCounts).reduce((a, b) => a + b, 0);
+  let startAngle = 0;
+  const cx = 80, cy = 80, r = 60, r2 = 36;
+  const donutSegs = Object.entries(srcCounts).map(([k, v], i) => {
+    const angle = (v / srcTotal) * 360;
+    const path = describeDonut(cx, cy, r, r2, startAngle, startAngle + angle);
+    startAngle += angle;
+    return `<path d="${path}" fill="${palette[i % palette.length]}" opacity="0.9"/>`;
+  }).join('');
+  const donutLegend = Object.entries(srcCounts).map(([k, v], i) => `
+    <div class="chart-legend-item">
+      <span class="swatch" style="background:${palette[i % palette.length]}"></span>
+      <span>${escapeHtml(k)} (${v})</span>
+    </div>
+  `).join('');
+
+  // Score histogram
+  const buckets = [0, 0, 0, 0, 0];
+  records.forEach(r => {
+    const s = r.score || 0;
+    const idx = Math.min(4, Math.floor(s / 20));
+    buckets[idx]++;
+  });
+  const maxB = Math.max(1, ...buckets);
+  const barW = 50, barGap = 12, barY = 130;
+  const labels = ['0-20', '20-40', '40-60', '60-80', '80-100'];
+  const bars = buckets.map((b, i) => {
+    const h = (b / maxB) * 100;
+    const x = 30 + i * (barW + barGap);
+    return `
+      <rect x="${x}" y="${barY - h}" width="${barW}" height="${h}" fill="${palette[i]}" rx="4"/>
+      <text x="${x + barW/2}" y="${barY - h - 6}" text-anchor="middle" fill="${textColor}" font-size="11" font-family="JetBrains Mono">${b}</text>
+      <text x="${x + barW/2}" y="${barY + 16}" text-anchor="middle" fill="${textColor}" font-size="11" font-family="JetBrains Mono">${labels[i]}</text>
+    `;
+  }).join('');
+
+  // Score line trend (by index)
+  const sorted = records.slice().sort((a, b) => (a.id || 0) - (b.id || 0));
+  const pts = sorted.map((rec, i) => {
+    const x = 30 + (i / Math.max(1, sorted.length - 1)) * 360;
+    const y = 160 - ((rec.score || 0) / 100) * 130;
+    return `${x},${y}`;
+  }).join(' ');
+  const lineSvg = `
+    <polyline points="${pts}" fill="none" stroke="${palette[1]}" stroke-width="2"/>
+    ${sorted.map((rec, i) => {
+      const x = 30 + (i / Math.max(1, sorted.length - 1)) * 360;
+      const y = 160 - ((rec.score || 0) / 100) * 130;
+      return `<circle cx="${x}" cy="${y}" r="3" fill="${palette[1]}"/>`;
+    }).join('')}
+  `;
+
+  $('#charts-grid').innerHTML = `
+    <div class="chart-block">
+      <div class="chart-title">Source distribution</div>
+      <svg viewBox="0 0 400 200" class="chart-svg">
+        ${donutSegs}
+      </svg>
+      <div class="chart-legend">${donutLegend}</div>
+    </div>
+    <div class="chart-block">
+      <div class="chart-title">Score histogram</div>
+      <svg viewBox="0 0 400 160" class="chart-svg">
+        <line x1="30" y1="130" x2="370" y2="130" stroke="${gridColor}"/>
+        ${bars}
+      </svg>
+    </div>
+    <div class="chart-block">
+      <div class="chart-title">Score trend (by record index)</div>
+      <svg viewBox="0 0 400 170" class="chart-svg">
+        <line x1="30" y1="30" x2="30" y2="160" stroke="${gridColor}"/>
+        <line x1="30" y1="160" x2="370" y2="160" stroke="${gridColor}"/>
+        ${lineSvg}
+      </svg>
+    </div>
+  `;
+}
+
+function describeDonut(cx, cy, r, r2, startDeg, endDeg) {
+  const startRad = (startDeg - 90) * Math.PI / 180;
+  const endRad = (endDeg - 90) * Math.PI / 180;
+  const x1 = cx + r * Math.cos(startRad);
+  const y1 = cy + r * Math.sin(startRad);
+  const x2 = cx + r * Math.cos(endRad);
+  const y2 = cy + r * Math.sin(endRad);
+  const x3 = cx + r2 * Math.cos(endRad);
+  const y3 = cy + r2 * Math.sin(endRad);
+  const x4 = cx + r2 * Math.cos(startRad);
+  const y4 = cy + r2 * Math.sin(startRad);
+  const large = (endDeg - startDeg) > 180 ? 1 : 0;
+  return `M ${x1} ${y1} A ${r} ${r} 0 ${large} 1 ${x2} ${y2} L ${x3} ${y3} A ${r2} ${r2} 0 ${large} 0 ${x4} ${y4} Z`;
+}
+
+/* =========================== Records =========================== */
+
+function refreshRecords() {
+  if (!state.currentRunId) return;
+  const q = $('#search-input').value;
+  const source = $('#source-filter').value;
+  const minScore = $('#score-filter').value || 0;
+  const sort = $('#sort-select').value;
+  const params = new URLSearchParams({ q, source, min_score: minScore, sort });
+  fetchJSON(`${API.records(state.currentRunId)}?${params}`)
+    .then(({ records, sources }) => {
+      state.records = records;
+      $('#results-meta').textContent = `${records.length} record(s)${q ? ' matching "' + q + '"' : ''}`;
+      // Populate source filter
+      const sf = $('#source-filter');
+      const cur = sf.value;
+      sf.innerHTML = '<option value="">All sources</option>' +
+        sources.map(s => `<option value="${escapeHtml(s)}">${escapeHtml(s)}</option>`).join('');
+      sf.value = cur;
+      renderRecords(records);
+      renderCharts(records);
+    })
+    .catch(err => toast(err.message, 'error'));
+}
+
+function renderRecords(records) {
+  if (!records.length) {
+    $('#records').innerHTML = '<div style="padding:24px;text-align:center;color:var(--text-mute);">No records yet.</div>';
+    return;
+  }
+  $('#records').innerHTML = records.map(r => {
+    const starred = state.watchlist.some(w => w.record_id === r.id || w.id === r.id);
+    const skills = (r.skills || []).slice(0, 6).map(s => `<span class="pill">${escapeHtml(s)}</span>`).join('');
+    return `
+      <div class="record" data-id="${escapeHtml(r.id)}">
+        <div class="record-top">
+          <div class="record-title">
+            <a href="${escapeHtml(r.url)}" target="_blank" rel="noopener">${escapeHtml(r.title || '(untitled)')}</a>
+          </div>
+          <button class="star-btn ${starred ? 'starred' : ''}" data-star="${escapeHtml(r.id)}" title="Add to watchlist">${starred ? '★' : '☆'}</button>
+        </div>
+        <div class="record-meta">
+          ${r.company ? `<span class="meta-company">${escapeHtml(r.company)}</span>` : ''}
+          ${r.location ? `<span class="meta-loc">📍 ${escapeHtml(r.location)}</span>` : ''}
+          <span class="meta-source">${escapeHtml(r.source)}</span>
+          ${r.score ? `<span class="meta-score">${r.score}/100</span>` : ''}
+        </div>
+        ${r.description ? `<div class="record-desc">${escapeHtml((r.description || '').slice(0, 220))}${(r.description || '').length > 220 ? '…' : ''}</div>` : ''}
+        ${skills ? `<div class="record-skills">${skills}</div>` : ''}
+      </div>
+    `;
+  }).join('');
+  $$('#records [data-star]').forEach(btn => {
+    btn.addEventListener('click', e => toggleWatchlist(btn.dataset.star, e.currentTarget));
+  });
+}
+
+/* =========================== Watchlist =========================== */
+
+function refreshWatchlist() {
+  fetchJSON(API.watchlist)
+    .then(({ items }) => { state.watchlist = items || []; })
+    .catch(() => { state.watchlist = []; });
+}
+
+function toggleWatchlist(recordId, btn) {
+  const existing = state.watchlist.find(w => w.record_id === recordId || w.id === recordId);
+  if (existing) {
+    fetchJSON(API.watchlistItem(existing.id), { method: 'DELETE' })
+      .then(() => {
+        btn.classList.remove('starred'); btn.textContent = '☆';
+        toast('Removed from watchlist', 'success');
+        refreshWatchlist();
+      })
+      .catch(err => toast(err.message, 'error'));
+  } else {
+    fetchJSON(API.watchlist, { method: 'POST', body: JSON.stringify({ record_id: recordId, run_id: state.currentRunId }) })
+      .then(() => {
+        btn.classList.add('starred'); btn.textContent = '★';
+        toast('Added to watchlist ★', 'success');
+        refreshWatchlist();
+      })
+      .catch(err => toast(err.message, 'error'));
+  }
+}
+
+function openWatchlistModal() {
+  const modal = $('#watchlist-modal');
+  if (!modal) { toast('Watchlist modal not in DOM yet', 'error'); return; }
+  fetchJSON(API.watchlist)
+    .then(({ items }) => {
+      state.watchlist = items || [];
+      const body = $('#watchlist-body');
+      if (!items.length) {
+        body.innerHTML = '<p style="color:var(--text-mute);padding:20px;">Star any record (☆ button) to add it here.</p>';
+      } else {
+        body.innerHTML = items.map(it => `
+          <div class="watchlist-item">
+            <div class="wi-title">${escapeHtml(it.title || '(untitled)')}</div>
+            <div class="wi-meta">${escapeHtml(it.run_id || '')} · ${timeAgo(new Date((it.created_at || Date.now()/1000) * 1000).toISOString())}</div>
+            <div class="wi-actions">
+              ${it.url ? `<a class="btn-ghost" href="${escapeHtml(it.url)}" target="_blank" rel="noopener">Open</a>` : ''}
+              <button class="btn-danger" data-rm="${escapeHtml(it.id)}">Remove</button>
+            </div>
+          </div>
+        `).join('');
+        $$('#watchlist-body [data-rm]').forEach(b => {
+          b.addEventListener('click', () => {
+            fetchJSON(API.watchlistItem(b.dataset.rm), { method: 'DELETE' })
+              .then(() => { toast('Removed', 'success'); openWatchlistModal(); refreshWatchlist(); })
+              .catch(err => toast(err.message, 'error'));
+          });
+        });
+      }
+      modal.hidden = false;
+    })
+    .catch(err => toast(err.message, 'error'));
+}
+
+/* =========================== Notifications =========================== */
+
+function refreshNotifications() {
+  fetchJSON(API.notifications)
+    .then(({ items }) => { state.notifications = items || []; updateNotifBadge(); })
+    .catch(() => { state.notifications = []; updateNotifBadge(); });
+}
+
+function updateNotifBadge() {
+  const badge = $('#notif-badge');
+  if (!badge) return;
+  const n = state.notifications.filter(x => !x.read_at).length;
+  badge.textContent = n > 0 ? n : '';
+  badge.style.display = n > 0 ? 'inline-block' : 'none';
+}
+
+function openNotificationsModal() {
+  const modal = $('#notifications-modal');
+  if (!modal) { toast('Notifications modal not in DOM yet', 'error'); return; }
+  const body = $('#notifications-body');
+  const items = state.notifications;
+  if (!items.length) {
+    body.innerHTML = '<p style="color:var(--text-mute);padding:20px;">No notifications yet. They appear when a run finishes or a webhook fires.</p>';
+  } else {
+    body.innerHTML = items.map(n => `
+      <div class="notif-item ${n.read_at ? '' : 'unread'}">
+        <div class="notif-title">${escapeHtml(n.title || n.kind || 'Notification')}</div>
+        <div class="notif-msg">${escapeHtml(n.message || n.body || '')}</div>
+        <div class="notif-meta">${timeAgo(new Date((n.created_at || Date.now()/1000) * 1000).toISOString())}</div>
+        <div class="notif-actions">
+          <button class="btn-ghost" data-dismiss="${escapeHtml(n.id)}">Mark read</button>
+          <button class="btn-danger" data-clear="${escapeHtml(n.id)}">Clear</button>
+        </div>
+      </div>
+    `).join('');
+    $$('#notifications-body [data-dismiss]').forEach(b => {
+      b.addEventListener('click', () => {
+        fetchJSON(API.notificationItem(b.dataset.dismiss), { method: 'PATCH' })
+          .then(() => { refreshNotifications(); openNotificationsModal(); })
+          .catch(err => toast(err.message, 'error'));
+      });
+    });
+    $$('#notifications-body [data-clear]').forEach(b => {
+      b.addEventListener('click', () => {
+        fetchJSON(API.notificationItem(b.dataset.clear), { method: 'DELETE' })
+          .then(() => { refreshNotifications(); openNotificationsModal(); })
+          .catch(err => toast(err.message, 'error'));
+      });
+    });
+  }
+  modal.hidden = false;
+}
+
+/* =========================== Bulk export =========================== */
+
+function openBulkExportModal() {
+  const modal = $('#bulk-export-modal');
+  if (!modal) { toast('Bulk export modal not in DOM yet', 'error'); return; }
+  const select = $('#bulk-export-runs');
+  if (select) {
+    select.innerHTML = (cachedRuns || []).map(r =>
+      `<option value="${escapeHtml(r.id)}" selected>${escapeHtml(r.prompt).slice(0, 80)} · ${r.total_records} rec</option>`
+    ).join('');
+  }
+  modal.hidden = false;
+}
+
+function runBulkExport() {
+  const fmt = ($('#bulk-export-fmt') || {}).value || 'json';
+  const select = $('#bulk-export-runs');
+  const ids = select ? Array.from(select.selectedOptions).map(o => o.value) : [];
+  if (!ids.length) { toast('Pick at least one run', 'error'); return; }
+  fetchJSON(API.bulkExport, {
+    method: 'POST',
+    body: JSON.stringify({ run_ids: ids, format: fmt }),
+  })
+    .then(res => {
+      if (res.url) {
+        window.location.href = res.url;
+      } else if (res.download_url) {
+        window.location.href = res.download_url;
+      } else {
+        // Fallback: build a quick client-side blob from current data if backend
+        // only returned counts (when records aren't loaded)
+        toast(`Bulk export queued: ${ids.length} runs as ${fmt}`, 'success');
+      }
+      $('#bulk-export-modal').hidden = true;
+    })
+    .catch(err => {
+      // Soft-fail: if backend endpoint isn't ready, still allow user to export
+      // the currently-open run as a single file.
+      if (state.currentRunId) {
+        toast('Bulk endpoint missing — exporting current run only', 'error');
+        exportRun(fmt);
+      } else {
+        toast(err.message, 'error');
+      }
+    });
+}
+
+/* =========================== Compare =========================== */
+
+function openCompareModal() {
+  const modal = $('#compare-modal');
+  if (!modal) return;
+  const select = $('#compare-b');
+  if (select) {
+    const other = (cachedRuns || []).filter(r => r.id !== state.currentRunId);
+    select.innerHTML = '<option value="">Pick a run…</option>' +
+      other.map(r => `<option value="${escapeHtml(r.id)}">${escapeHtml(r.prompt).slice(0, 80)} (${r.total_records} rec)</option>`).join('');
+    select.onchange = () => {
+      if (state.currentRunId && select.value) doCompare(select.value);
+    };
+  }
+  $('#compare-result').innerHTML = '';
+  modal.hidden = false;
+}
+
+function doCompare(bId) {
+  if (!state.currentRunId || !bId) return;
+  fetchJSON(`${API.compare}?a=${state.currentRunId}&b=${bId}`)
+    .then(res => {
+      const d = res.diff || {};
+      $('#compare-result').innerHTML = `
+        <div class="compare-grid">
+          <div class="compare-col">
+            <h4>Run A · ${escapeHtml((res.a.run || {}).prompt || '').slice(0, 60)}</h4>
+            <div>Records: ${d.a_records || 0}</div>
+            <div>Avg score: ${d.a_avg_score || 0}</div>
+            <div>Sources: ${Object.entries(d.a_sources || {}).map(([k,v]) => `${escapeHtml(k)} (${v})`).join(', ') || '—'}</div>
+          </div>
+          <div class="compare-col">
+            <h4>Run B · ${escapeHtml((res.b.run || {}).prompt || '').slice(0, 60)}</h4>
+            <div>Records: ${d.b_records || 0}</div>
+            <div>Avg score: ${d.b_avg_score || 0}</div>
+            <div>Sources: ${Object.entries(d.b_sources || {}).map(([k,v]) => `${escapeHtml(k)} (${v})`).join(', ') || '—'}</div>
+          </div>
+        </div>
+        <div class="compare-summary">
+          <h4>Summary A</h4>
+          <div>${escapeHtml(((res.a.summary || {}).narrative || '').slice(0, 400))}</div>
+          <h4 style="margin-top:10px;">Summary B</h4>
+          <div>${escapeHtml(((res.b.summary || {}).narrative || '').slice(0, 400))}</div>
+        </div>
+      `;
+    })
+    .catch(err => toast(err.message, 'error'));
+}
+
+/* =========================== Replay & Diff =========================== */
+
+function openReplayDiffModal() {
+  if (!state.currentRunId) return;
+  const modal = $('#replay-diff-modal');
+  if (!modal) { toast('Replay & Diff modal not in DOM yet', 'error'); return; }
+  $('#replay-diff-result').innerHTML = '<p style="color:var(--text-mute);">Click "Compare" to replay this prompt and diff the new dataset against the original.</p>';
+  modal.hidden = false;
+}
+
+function runReplayDiff() {
+  if (!state.currentRunId) return;
+  const btn = $('#btn-run-replay-diff');
+  if (btn) { btn.disabled = true; btn.textContent = 'Replaying…'; }
+  $('#replay-diff-result').innerHTML = '<div class="spinner"></div><div>Replaying workflow…</div>';
+  fetchJSON(API.replayDiff(state.currentRunId), { method: 'POST' })
+    .then(res => {
+      if (btn) { btn.disabled = false; btn.textContent = 'Replay & Compare'; }
+      const d = res.diff || {};
+      $('#replay-diff-result').innerHTML = `
+        <div class="diff-grid">
+          <div class="diff-col"><h4>Original</h4><div>Records: ${d.a_records || 0}</div><div>Avg score: ${d.a_avg_score || 0}</div></div>
+          <div class="diff-col"><h4>Replay</h4><div>Records: ${d.b_records || 0}</div><div>Avg score: ${d.b_avg_score || 0}</div></div>
+          <div class="diff-col"><h4>Δ Delta</h4><div>Records Δ: ${(d.b_records || 0) - (d.a_records || 0)}</div><div>Score Δ: ${(((d.b_avg_score || 0) - (d.a_avg_score || 0)) || 0).toFixed(1)}</div></div>
+        </div>
+        <pre class="diff-raw">${escapeHtml(JSON.stringify(d, null, 2))}</pre>
+      `;
+      refreshRuns();
+    })
+    .catch(err => {
+      if (btn) { btn.disabled = false; btn.textContent = 'Replay & Compare'; }
+      toast(err.message, 'error');
+    });
+}
+
+/* =========================== Data Quality =========================== */
+
+function openQualityModal() {
+  if (!state.currentRunId) return;
+  const modal = $('#quality-modal');
+  if (!modal) { toast('Quality modal not in DOM yet', 'error'); return; }
+  $('#quality-body').innerHTML = '<div class="spinner"></div><div>Checking data quality…</div>';
+  modal.hidden = false;
+  fetchJSON(API.quality(state.currentRunId))
+    .then(res => {
+      const q = res.quality || res || {};
+      const checks = q.checks || [];
+      $('#quality-body').innerHTML = `
+        <div class="quality-summary">
+          <div class="qs-item"><span>Score</span><strong>${q.overall_score ?? q.score ?? '—'}/100</strong></div>
+          <div class="qs-item"><span>Records</span><strong>${q.total_records ?? 0}</strong></div>
+          <div class="qs-item"><span>URLs valid</span><strong>${q.valid_urls ?? '—'}</strong></div>
+          <div class="qs-item"><span>Duplicates</span><strong>${q.duplicates ?? 0}</strong></div>
+        </div>
+        <div class="quality-checks">
+          ${checks.map(c => `
+            <div class="qc-row ${c.passed ? 'pass' : 'fail'}">
+              <span class="qc-icon">${c.passed ? '✓' : '✕'}</span>
+              <span class="qc-name">${escapeHtml(c.name || c.label || '')}</span>
+              <span class="qc-detail">${escapeHtml(c.detail || c.message || '')}</span>
+            </div>
+          `).join('') || '<p style="color:var(--text-mute)">No checks returned.</p>'}
+        </div>
+        ${q.narrative ? `<div class="quality-narrative">${escapeHtml(q.narrative)}</div>` : ''}
+      `;
+    })
+    .catch(err => {
+      $('#quality-body').innerHTML = `<p style="color:var(--error)">${escapeHtml(err.message)}</p>`;
+    });
+}
+
+/* =========================== Source explorer =========================== */
+
+function openSourcesModal() {
+  if (!state.currentRunId) return;
+  const modal = $('#sources-modal');
+  if (!modal) { toast('Sources modal not in DOM yet', 'error'); return; }
+  $('#sources-body').innerHTML = '<div class="spinner"></div><div>Loading sources…</div>';
+  modal.hidden = false;
+  fetchJSON(API.runSources(state.currentRunId))
+    .then(({ sources }) => {
+      if (!sources || !sources.length) {
+        $('#sources-body').innerHTML = '<p style="color:var(--text-mute);padding:20px;">No sources recorded for this run.</p>';
+        return;
+      }
+      $('#sources-body').innerHTML = sources.map(s => `
+        <div class="source-row">
+          <div class="src-name">${escapeHtml(s.source || s.name || '')}</div>
+          <div class="src-meta">
+            ${s.records_out != null ? `<span>${s.records_out} rec</span>` : ''}
+            ${s.latency_ms != null ? `<span>${s.latency_ms}ms</span>` : ''}
+            <span class="src-status ${escapeHtml(s.status || '')}">${escapeHtml(s.status || '')}</span>
+          </div>
+          ${s.error ? `<div class="src-error">${escapeHtml(s.error)}</div>` : ''}
+          ${s.url ? `<a class="src-url" href="${escapeHtml(s.url)}" target="_blank" rel="noopener">${escapeHtml(s.url)}</a>` : ''}
+        </div>
+      `).join('');
+    })
+    .catch(err => {
+      $('#sources-body').innerHTML = `<p style="color:var(--error)">${escapeHtml(err.message)}</p>`;
+    });
+}
+
+/* =========================== A/B Test =========================== */
+
+function openAbTestModal() {
+  const modal = $('#ab-modal');
+  if (!modal) { toast('A/B modal not in DOM yet', 'error'); return; }
+  $('#ab-result').innerHTML = '';
+  modal.hidden = false;
+}
+
+function runAbTest() {
+  const a = ($('#ab-prompt-a') || {}).value || '';
+  const b = ($('#ab-prompt-b') || {}).value || '';
+  if (!a.trim() || !b.trim()) { toast('Enter both prompt A and prompt B', 'error'); return; }
+  $('#ab-result').innerHTML = '<div class="spinner"></div><div>Running both prompts in parallel…</div>';
+  fetchJSON(API.abTest, { method: 'POST', body: JSON.stringify({ prompt_a: a, prompt_b: b }) })
+    .then(res => {
+      const A = res.a || {}, B = res.b || {};
+      $('#ab-result').innerHTML = `
+        <div class="ab-grid">
+          <div class="ab-col">
+            <h4>A · ${escapeHtml(a.slice(0,60))}</h4>
+            <div>Run: ${A.run_id || '—'}</div>
+            <div>Records: ${A.records_count ?? A.total_records ?? '—'}</div>
+            <div>Avg score: ${A.avg_score ?? '—'}</div>
+            <div>Status: ${escapeHtml(A.status || '—')}</div>
+          </div>
+          <div class="ab-col">
+            <h4>B · ${escapeHtml(b.slice(0,60))}</h4>
+            <div>Run: ${B.run_id || '—'}</div>
+            <div>Records: ${B.records_count ?? B.total_records ?? '—'}</div>
+            <div>Avg score: ${B.avg_score ?? '—'}</div>
+            <div>Status: ${escapeHtml(B.status || '—')}</div>
+          </div>
+        </div>
+        <div class="ab-verdict">
+          <strong>Verdict:</strong> ${escapeHtml(res.verdict || res.winner || 'See stats above.')}
+        </div>
+        <pre class="ab-raw">${escapeHtml(JSON.stringify(res, null, 2))}</pre>
+      `;
+      refreshRuns();
+    })
+    .catch(err => {
+      $('#ab-result').innerHTML = `<p style="color:var(--error)">${escapeHtml(err.message)}</p>`;
+    });
+}
+
+/* =========================== Analytics =========================== */
+
+function openAnalyticsModal() {
+  const modal = $('#analytics-modal');
+  if (!modal) { toast('Analytics modal not in DOM yet', 'error'); return; }
+  $('#analytics-body').innerHTML = '<div class="spinner"></div><div>Computing analytics…</div>';
+  modal.hidden = false;
+  // Aggregate from cached runs
+  const totalRuns = cachedRuns.length;
+  const totalRec = cachedRuns.reduce((a, r) => a + (r.total_records || 0), 0);
+  const byStatus = cachedRuns.reduce((m, r) => { m[r.status] = (m[r.status] || 0) + 1; return m; }, {});
+  const recent = cachedRuns.slice(0, 8);
+  $('#analytics-body').innerHTML = `
+    <div class="analytics-grid">
+      <div class="ag-item"><span>Total runs</span><strong>${totalRuns}</strong></div>
+      <div class="ag-item"><span>Total records</span><strong>${totalRec}</strong></div>
+      <div class="ag-item"><span>Avg records/run</span><strong>${totalRuns ? (totalRec/totalRuns).toFixed(1) : 0}</strong></div>
+      <div class="ag-item"><span>Success rate</span><strong>${totalRuns ? Math.round(((byStatus.done||0)/totalRuns)*100) : 0}%</strong></div>
+    </div>
+    <h4 style="margin-top:14px;">Status breakdown</h4>
+    <div class="ag-status">${Object.entries(byStatus).map(([k,v]) => `<span class="pill">${escapeHtml(k)}: ${v}</span>`).join('') || '<span style="color:var(--text-mute)">No data</span>'}</div>
+    <h4 style="margin-top:14px;">Recent runs</h4>
+    <div class="ag-recent">
+      ${recent.map(r => `
+        <div class="ag-run">
+          <span class="status-dot ${escapeHtml(r.status)}"></span>
+          <span>${escapeHtml((r.prompt || '').slice(0,80))}</span>
+          <span style="color:var(--text-mute);margin-left:auto;">${r.total_records} rec</span>
+        </div>
+      `).join('') || '<span style="color:var(--text-mute)">No runs yet</span>'}
+    </div>
+  `;
+}
+
+/* =========================== Schedules =========================== */
+
+function saveSchedule() {
+  const prompt = $('#schedule-prompt').value.trim();
+  const interval_seconds = parseInt($('#schedule-interval').value, 10);
+  if (!prompt) { toast('Prompt is required', 'error'); return; }
+  fetchJSON(API.schedules, {
+    method: 'POST',
+    body: JSON.stringify({ prompt, interval_seconds }),
+  })
+    .then(() => {
+      toast('Schedule saved', 'success');
+      $('#schedule-modal').hidden = true;
+      $('#schedule-prompt').value = '';
+      refreshSchedules();
+    })
+    .catch(err => toast(err.message, 'error'));
+}
+
+function refreshSchedules() {
+  fetchJSON(API.schedules)
+    .then(({ schedules }) => {
+      const list = $('#schedule-list');
+      if (!list) return;
+      if (!schedules.length) { list.innerHTML = '<div style="color:var(--text-mute);font-size:12px;padding:6px;">No schedules yet</div>'; return; }
+      list.innerHTML = schedules.map(s => `
+        <div class="schedule-row">
+          <label class="switch">
+            <input type="checkbox" data-toggle="${escapeHtml(s.id)}" ${s.enabled ? 'checked' : ''}>
+            <span class="slider"></span>
+          </label>
+          <div class="sched-text">
+            <div class="sched-prompt">${escapeHtml((s.prompt || '').slice(0, 60))}</div>
+            <div class="sched-meta">every ${Math.round((s.interval_seconds || 3600) / 60)} min · next ${timeAgo(new Date((s.next_run_at || Date.now()/1000) * 1000).toISOString())}</div>
+          </div>
+          <button class="rl-del" data-del-sched="${escapeHtml(s.id)}" title="Delete schedule">×</button>
+        </div>
+      `).join('');
+      $$('#schedule-list [data-toggle]').forEach(t => {
+        t.addEventListener('change', () => {
+          fetchJSON(API.scheduleToggle(t.dataset.toggle), {
+            method: 'POST', body: JSON.stringify({ enabled: t.checked }),
+          }).then(refreshSchedules).catch(err => toast(err.message, 'error'));
+        });
+      });
+      $$('#schedule-list [data-del-sched]').forEach(b => {
+        b.addEventListener('click', () => {
+          fetchJSON(API.schedule(b.dataset.delSched), { method: 'DELETE' })
+            .then(refreshSchedules).catch(err => toast(err.message, 'error'));
+        });
+      });
+    })
+    .catch(() => {});
+}
+
+/* =========================== Webhooks =========================== */
+
+function saveWebhook() {
+  const url = $('#webhook-url').value.trim();
+  const type = $('#webhook-type').value;
+  const event = $('#webhook-event').value;
+  if (!url) { toast('Webhook URL is required', 'error'); return; }
+  fetchJSON(API.webhooks, {
+    method: 'POST',
+    body: JSON.stringify({ url, type, event }),
+  })
+    .then(() => {
+      toast('Webhook saved', 'success');
+      $('#webhook-modal').hidden = true;
+      $('#webhook-url').value = '';
+      refreshWebhooks();
+    })
+    .catch(err => toast(err.message, 'error'));
+}
+
+function refreshWebhooks() {
+  fetchJSON(API.webhooks)
+    .then(({ webhooks }) => {
+      const list = $('#webhook-list');
+      if (!list) return;
+      if (!webhooks.length) { list.innerHTML = '<div style="color:var(--text-mute);font-size:12px;padding:6px;">No webhooks yet</div>'; return; }
+      list.innerHTML = webhooks.map(w => `
+        <div class="webhook-row">
+          <div class="wh-text">
+            <div class="wh-type">${escapeHtml(w.type || 'generic')} · ${escapeHtml(w.event || 'run_done')}</div>
+            <div class="wh-url">${escapeHtml((w.url || '').slice(0, 50))}</div>
+          </div>
+          <button class="rl-del" data-del-wh="${escapeHtml(w.id)}" title="Delete webhook">×</button>
+        </div>
+      `).join('');
+      $$('#webhook-list [data-del-wh]').forEach(b => {
+        b.addEventListener('click', () => {
+          fetchJSON(API.webhook(b.dataset.delWh), { method: 'DELETE' })
+            .then(refreshWebhooks).catch(err => toast(err.message, 'error'));
+        });
+      });
+    })
+    .catch(() => {});
+}

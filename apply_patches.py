@@ -1,7 +1,673 @@
-/* AI Data Intelligence Platform - frontend logic (v4)
- * Matches the exact modal/element IDs in templates/index.html
- */
+"""
+apply_patches.py - One-shot patch script for the Data Intelligence Platform.
 
+Fixes 4 things in your project:
+  1. data_intelligence/database.py - add watchlist + notifications tables and helpers
+  2. app.py                          - add missing endpoints (clear-all, ab-test, watchlist,
+                                         notifications, bulk-export, replay-diff, quality, sources)
+  3. templates/index.html            - add bulk-export modal
+  4. static/js/app.js                - rewrite to match actual HTML element IDs
+
+Usage (from project root):
+  python apply_patches.py
+
+It writes *.bak backups next to each touched file. If a patch has already been
+applied it is a no-op for that file.
+"""
+from __future__ import annotations
+import os
+import sys
+import shutil
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+
+
+def _backup(path: Path) -> None:
+    bak = path.with_suffix(path.suffix + ".bak")
+    if not bak.exists():
+        shutil.copy2(path, bak)
+        print(f"  backup -> {bak.name}")
+
+
+def _read(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def _write(path: Path, content: str) -> None:
+    _backup(path)
+    path.write_text(content, encoding="utf-8")
+    print(f"  patched {path.relative_to(ROOT)}")
+
+
+# ---------------------------------------------------------------------------
+# 1. database.py - add tables to init_db() and new helpers at end of file
+# ---------------------------------------------------------------------------
+DATABASE_NEW_TABLES = """
+            CREATE TABLE IF NOT EXISTS watchlist (
+                id TEXT PRIMARY KEY,
+                record_id TEXT,
+                run_id TEXT,
+                url TEXT,
+                title TEXT,
+                created_at REAL
+            );
+
+            CREATE TABLE IF NOT EXISTS notifications (
+                id TEXT PRIMARY KEY,
+                kind TEXT,
+                title TEXT,
+                message TEXT,
+                run_id TEXT,
+                created_at REAL,
+                read_at REAL
+            );
+"""
+
+DATABASE_NEW_FUNCS = '''
+
+
+# ======================================================================
+# Watchlist
+# ======================================================================
+
+def add_watchlist(item_id: str, record_id: str, run_id: str, url: str, title: str) -> None:
+    with _DB_LOCK:
+        conn = _connect()
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO watchlist (id, record_id, run_id, url, title, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (item_id, record_id, run_id, url, title, time.time()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def list_watchlist() -> List[Dict[str, Any]]:
+    with _DB_LOCK:
+        conn = _connect()
+        try:
+            rows = conn.execute("SELECT * FROM watchlist ORDER BY created_at DESC").fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+
+def remove_watchlist(item_id: str) -> bool:
+    with _DB_LOCK:
+        conn = _connect()
+        try:
+            cur = conn.execute("DELETE FROM watchlist WHERE id = ?", (item_id,))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+
+def find_watchlist_by_record(record_id: str) -> Optional[Dict[str, Any]]:
+    with _DB_LOCK:
+        conn = _connect()
+        try:
+            row = conn.execute("SELECT * FROM watchlist WHERE record_id = ?", (record_id,)).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+
+# ======================================================================
+# Notifications
+# ======================================================================
+
+def add_notification(notif_id: str, kind: str, title: str, message: str, run_id: str = "") -> None:
+    with _DB_LOCK:
+        conn = _connect()
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO notifications (id, kind, title, message, run_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (notif_id, kind, title, message, run_id, time.time()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def list_notifications() -> List[Dict[str, Any]]:
+    with _DB_LOCK:
+        conn = _connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM notifications ORDER BY created_at DESC LIMIT 100"
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+
+def mark_notification_read(notif_id: str) -> bool:
+    with _DB_LOCK:
+        conn = _connect()
+        try:
+            cur = conn.execute(
+                "UPDATE notifications SET read_at = ? WHERE id = ?",
+                (time.time(), notif_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+
+def delete_notification(notif_id: str) -> bool:
+    with _DB_LOCK:
+        conn = _connect()
+        try:
+            cur = conn.execute("DELETE FROM notifications WHERE id = ?", (notif_id,))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+
+def clear_notifications() -> int:
+    with _DB_LOCK:
+        conn = _connect()
+        try:
+            cur = conn.execute("DELETE FROM notifications")
+            conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
+
+
+# ======================================================================
+# Clear all runs
+# ======================================================================
+
+def delete_all_runs() -> int:
+    with _DB_LOCK:
+        conn = _connect()
+        try:
+            cur = conn.cursor()
+            # Manually clean records first (FK cascade is not enforced unless
+            # PRAGMA foreign_keys = ON, so be explicit for portability).
+            cur.execute("DELETE FROM records")
+            cur.execute("DELETE FROM share_links")
+            cur.execute("DELETE FROM runs")
+            conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
+'''
+
+
+def patch_database() -> bool:
+    path = ROOT / "data_intelligence" / "database.py"
+    if not path.exists():
+        print(f"  SKIP: {path} not found")
+        return False
+    src = _read(path)
+
+    changed = False
+    # 1) insert new tables inside init_db() block
+    marker_tables = "CREATE TABLE IF NOT EXISTS source_health ("
+    if marker_tables in src and "CREATE TABLE IF NOT EXISTS watchlist (" not in src:
+        src = src.replace(
+            marker_tables,
+            DATABASE_NEW_TABLES.strip() + "\n            " + marker_tables,
+            1,
+        )
+        changed = True
+
+    # 2) append new helpers at end
+    if "def delete_all_runs" not in src:
+        src = src.rstrip() + "\n" + DATABASE_NEW_FUNCS
+        changed = True
+
+    if changed:
+        _write(path, src)
+    else:
+        print(f"  database.py already patched")
+    return changed
+
+
+# ---------------------------------------------------------------------------
+# 2. app.py - add new endpoints before "# Error handlers" block
+# ---------------------------------------------------------------------------
+APP_NEW_ENDPOINTS = '''
+
+
+# ======================================================================
+# Clear all runs (used by sidebar "Clear" button)
+# ======================================================================
+
+@app.route("/api/runs", methods=["DELETE"])
+def delete_all_runs_route():
+    n = db.delete_all_runs()
+    return jsonify({"deleted": n})
+
+
+# ======================================================================
+# A/B test - run two prompts in parallel and return both run_ids
+# ======================================================================
+
+@app.route("/api/ab-test", methods=["POST"])
+def ab_test_route():
+    body = request.get_json(force=True) or {}
+    pa = (body.get("prompt_a") or body.get("prompt1") or "").strip()
+    pb = (body.get("prompt_b") or body.get("prompt2") or "").strip()
+    if not pa or not pb:
+        return jsonify({"error": "prompt_a and prompt_b required"}), 400
+    ra = uuid.uuid4().hex[:8]
+    rb = uuid.uuid4().hex[:8]
+    db.create_run(ra, pa)
+    db.create_run(rb, pb)
+
+    def _persist_a(meta, records):
+        db.save_run(meta, records)
+        db.update_run_status(ra, meta["status"])
+
+    def _persist_b(meta, records):
+        db.save_run(meta, records)
+        db.update_run_status(rb, meta["status"])
+
+    orchestrator.execute_async(ra, pa, persist_fn=_persist_a)
+    orchestrator.execute_async(rb, pb, persist_fn=_persist_b)
+
+    db.add_notification(
+        uuid.uuid4().hex[:8], "ab_test", "A/B test started",
+        f"Prompt A: {pa[:60]} | Prompt B: {pb[:60]}", ra,
+    )
+    return jsonify({"run_a": ra, "run_b": rb, "status": "running"}), 202
+
+
+# ======================================================================
+# Watchlist
+# ======================================================================
+
+@app.route("/api/watchlist", methods=["GET"])
+def list_watchlist_route():
+    return jsonify({"items": db.list_watchlist()})
+
+
+@app.route("/api/watchlist", methods=["POST"])
+def add_watchlist_route():
+    body = request.get_json(force=True) or {}
+    record_id = (body.get("record_id") or "").strip()
+    run_id = body.get("run_id") or ""
+    url = body.get("url") or ""
+    title = body.get("title") or ""
+    if not record_id and not url:
+        return jsonify({"error": "record_id or url required"}), 400
+    item_id = uuid.uuid4().hex[:8]
+    db.add_watchlist(item_id, record_id, run_id, url, title)
+    return jsonify({"id": item_id}), 201
+
+
+@app.route("/api/watchlist/<item_id>", methods=["DELETE"])
+def remove_watchlist_route(item_id: str):
+    ok = db.remove_watchlist(item_id)
+    return jsonify({"deleted": ok})
+
+
+# ======================================================================
+# Notifications
+# ======================================================================
+
+@app.route("/api/notifications", methods=["GET"])
+def list_notifications_route():
+    return jsonify({"items": db.list_notifications()})
+
+
+@app.route("/api/notifications/<notif_id>", methods=["PATCH"])
+def mark_notification_read_route(notif_id: str):
+    ok = db.mark_notification_read(notif_id)
+    return jsonify({"marked": ok})
+
+
+@app.route("/api/notifications/<notif_id>", methods=["DELETE"])
+def delete_notification_route(notif_id: str):
+    ok = db.delete_notification(notif_id)
+    return jsonify({"deleted": ok})
+
+
+@app.route("/api/notifications/clear", methods=["POST"])
+def clear_notifications_route():
+    n = db.clear_notifications()
+    return jsonify({"cleared": n})
+
+
+@app.route("/api/admin/notify", methods=["POST"])
+def admin_notify_route():
+    body = request.get_json(force=True) or {}
+    nid = uuid.uuid4().hex[:8]
+    db.add_notification(
+        nid,
+        body.get("kind") or "info",
+        body.get("title") or "Notification",
+        body.get("message") or "",
+        body.get("run_id") or "",
+    )
+    return jsonify({"id": nid}), 201
+
+
+# ======================================================================
+# Bulk export - zip multiple runs into a single archive
+# ======================================================================
+
+@app.route("/api/bulk-export", methods=["POST"])
+def bulk_export_route():
+    body = request.get_json(force=True) or {}
+    run_ids = body.get("run_ids") or []
+    fmt = (body.get("format") or "json").lower()
+    if not run_ids:
+        return jsonify({"error": "run_ids required"}), 400
+    import zipfile
+    buf = io.BytesIO()
+    written = 0
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for rid in run_ids:
+            recs = db.list_records(rid, limit=500)
+            if not recs:
+                continue
+            if fmt == "csv":
+                sbuf = io.StringIO()
+                writer = csv.DictWriter(sbuf, fieldnames=[
+                    "id", "type", "source", "title", "company", "location",
+                    "url", "skills", "industries", "score", "published_at", "description",
+                ])
+                writer.writeheader()
+                for r in recs:
+                    writer.writerow({
+                        "id": r.get("id"), "type": r.get("type"),
+                        "source": r.get("source"), "title": r.get("title"),
+                        "company": r.get("company"), "location": r.get("location"),
+                        "url": r.get("url"),
+                        "skills": ", ".join(r.get("skills") or []),
+                        "industries": ", ".join(r.get("industries") or []),
+                        "score": r.get("score"),
+                        "published_at": r.get("published_at"),
+                        "description": (r.get("description") or "")[:500],
+                    })
+                zf.writestr(f"dataset_{rid}.csv", sbuf.getvalue())
+            else:
+                zf.writestr(f"dataset_{rid}.json", json.dumps(recs, indent=2))
+            written += 1
+    data = buf.getvalue()
+    if not written:
+        return jsonify({"error": "no records in selected runs"}), 404
+    return send_file(
+        io.BytesIO(data),
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name=f"bulk_export_{int(time.time())}.zip",
+    )
+
+
+# ======================================================================
+# Per-run replay & diff (sync - waits up to 90s for replay to finish)
+# ======================================================================
+
+@app.route("/api/runs/<run_id>/replay-diff", methods=["POST"])
+def replay_diff_route(run_id: str):
+    detail = db.get_run_detail(run_id)
+    if not detail:
+        abort(404)
+    from data_intelligence.ai_summarizer import summarize_run
+    prompt = detail["prompt"]
+    new_id = uuid.uuid4().hex[:8]
+    db.create_run(new_id, prompt)
+
+    def _persist(meta, records):
+        db.save_run(meta, records)
+        db.update_run_status(new_id, meta["status"])
+
+    orchestrator.execute_async(new_id, prompt, persist_fn=_persist)
+
+    deadline = time.time() + 90
+    finished_status = None
+    while time.time() < deadline:
+        time.sleep(0.6)
+        live = orchestrator.get_run(new_id)
+        if live and live.get("status") in ("done", "failed"):
+            finished_status = live.get("status")
+            break
+        det = db.get_run_detail(new_id)
+        if det and det.get("status") in ("done", "failed"):
+            finished_status = det.get("status")
+            break
+
+    a_recs = db.list_records(run_id, limit=500)
+    b_det = db.get_run_detail(new_id)
+    b_recs = db.list_records(new_id, limit=500)
+    if not b_det:
+        return jsonify({"error": "replay did not finish in time"}), 504
+
+    a_summary = summarize_run(detail, a_recs)
+    b_summary = summarize_run(b_det, b_recs)
+
+    from collections import Counter
+    sa = Counter(r.get("source") for r in a_recs)
+    sb = Counter(r.get("source") for r in b_recs)
+    scores_a = [r.get("score") or 0 for r in a_recs]
+    scores_b = [r.get("score") or 0 for r in b_recs]
+
+    a_titles = [(r.get("title") or "").strip() for r in a_recs if r.get("title")]
+    b_titles = [(r.get("title") or "").strip() for r in b_recs if r.get("title")]
+    a_set = {t.lower() for t in a_titles}
+    b_set = {t.lower() for t in b_titles}
+    only_a = [t for t in a_titles if t.lower() not in b_set][:5]
+    only_b = [t for t in b_titles if t.lower() not in a_set][:5]
+
+    diff = {
+        "a_records": len(a_recs),
+        "b_records": len(b_recs),
+        "records_delta": len(b_recs) - len(a_recs),
+        "a_avg_score": round(sum(scores_a)/len(scores_a), 1) if scores_a else 0,
+        "b_avg_score": round(sum(scores_b)/len(scores_b), 1) if scores_b else 0,
+        "score_delta": round((sum(scores_b)/max(1, len(scores_b))) - (sum(scores_a)/max(1, len(scores_a))), 1),
+        "a_sources": dict(sa),
+        "b_sources": dict(sb),
+        "only_in_original": only_a,
+        "only_in_replay": only_b,
+        "replay_status": finished_status or "unknown",
+    }
+    return jsonify({
+        "original_run_id": run_id,
+        "replay_run_id": new_id,
+        "diff": diff,
+        "a_summary": a_summary,
+        "b_summary": b_summary,
+    })
+
+
+# ======================================================================
+# Per-run data quality
+# ======================================================================
+
+@app.route("/api/runs/<run_id>/quality", methods=["GET"])
+def quality_route(run_id: str):
+    from data_intelligence import data_quality
+    detail = db.get_run_detail(run_id)
+    if not detail:
+        abort(404)
+    recs = db.list_records(run_id, limit=500)
+    report = data_quality.quality_report_for_records(recs)
+
+    checks = []
+    total = report.get("total", 0)
+    ok_urls = report.get("ok_urls", 0)
+    mock_urls = report.get("mock_urls", 0)
+    pii_records = report.get("pii_records", 0)
+    completeness_avg = report.get("completeness_avg", 0)
+
+    checks.append({
+        "name": "URLs valid",
+        "passed": ok_urls == total,
+        "detail": f"{ok_urls}/{total} records have a parseable URL",
+    })
+    checks.append({
+        "name": "No mock URLs",
+        "passed": mock_urls == 0,
+        "detail": f"{mock_urls} records use mock/example URLs" if mock_urls else "All URLs are real",
+    })
+    checks.append({
+        "name": "No PII detected",
+        "passed": pii_records == 0,
+        "detail": f"{pii_records} records contain emails/phones" if pii_records else "No PII found",
+    })
+    checks.append({
+        "name": "Average completeness >= 50%",
+        "passed": completeness_avg >= 0.5,
+        "detail": f"Average field completeness is {round(completeness_avg*100)}%",
+    })
+    checks.append({
+        "name": "Dataset size >= 10 records",
+        "passed": total >= 10,
+        "detail": f"{total} records collected",
+    })
+
+    score = sum(20 for c in checks if c["passed"])
+
+    narrative = (
+        f"This dataset scores {score}/100. "
+        + ("Looks healthy and ready to ship." if score >= 80 else
+           "Some checks need attention - review details below." if score >= 40 else
+           "Significant quality issues - re-run with stricter sources.")
+    )
+
+    return jsonify({
+        "quality": {
+            "overall_score": score,
+            "total_records": total,
+            "valid_urls": ok_urls,
+            "mock_urls": mock_urls,
+            "duplicates": total - len({(r.get("url") or r.get("id")) for r in recs}),
+            "checks": checks,
+            "narrative": narrative,
+            "fields_present_pct": report.get("fields_present_pct", {}),
+        }
+    })
+
+
+# ======================================================================
+# Per-run sources (for source explorer)
+# ======================================================================
+
+@app.route("/api/runs/<run_id>/sources", methods=["GET"])
+def run_sources_route(run_id: str):
+    detail = db.get_run_detail(run_id)
+    if not detail:
+        abort(404)
+    workflow = detail.get("workflow") or {}
+    steps = [s for s in (workflow.get("steps") or []) if s.get("type") == "collect"]
+    return jsonify({"sources": steps})
+
+'''
+
+
+def patch_app() -> bool:
+    path = ROOT / "app.py"
+    if not path.exists():
+        print(f"  SKIP: {path} not found")
+        return False
+    src = _read(path)
+    if "delete_all_runs_route" in src:
+        print("  app.py already patched")
+        return False
+
+    marker = "# ----------------------------------------------------------------------\n# Error handlers"
+    if marker not in src:
+        marker = 'if __name__ == "__main__":'
+    if marker not in src:
+        print(f"  ERROR: marker not found in app.py")
+        return False
+    src = src.replace(marker, APP_NEW_ENDPOINTS + "\n\n" + marker, 1)
+    _write(path, src)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# 3. templates/index.html - add bulk-export-modal
+# ---------------------------------------------------------------------------
+INDEX_NEW_MODAL = '''
+<!-- Bulk Export modal -->
+<div class="modal" id="bulk-export-modal" hidden>
+  <div class="modal-card wide">
+    <div class="modal-header">
+      <div class="modal-title">📦 Bulk Export</div>
+      <button class="modal-close" data-close="bulk-export-modal">×</button>
+    </div>
+    <div class="modal-body">
+      <p style="color:var(--text-mute);margin-bottom:10px;">Pick the runs to include in one ZIP archive:</p>
+      <div style="margin-bottom:10px;">
+        <button class="btn-secondary" id="bulk-select-all" style="font-size:11px;padding:4px 8px;">Select all</button>
+        <button class="btn-secondary" id="bulk-select-none" style="font-size:11px;padding:4px 8px;">Clear</button>
+      </div>
+      <select id="bulk-export-runs" multiple size="8" style="width:100%;padding:8px;border-radius:8px;border:1px solid var(--border);background:var(--bg-2);color:var(--text);"></select>
+      <label style="font-size:12px;color:var(--text-mute);text-transform:uppercase;display:block;margin-top:14px;">Format (per file inside ZIP)</label>
+      <select id="bulk-export-fmt" style="width:100%;margin-top:6px;padding:10px;border-radius:8px;border:1px solid var(--border);background:var(--bg-2);color:var(--text);">
+        <option value="json">JSON</option>
+        <option value="csv">CSV</option>
+      </select>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-secondary" data-close="bulk-export-modal">Cancel</button>
+      <button class="btn-primary" id="btn-bulk-go">Download ZIP</button>
+    </div>
+  </div>
+</div>
+
+'''
+
+
+def patch_index() -> bool:
+    path = ROOT / "templates" / "index.html"
+    if not path.exists():
+        print(f"  SKIP: {path} not found")
+        return False
+    src = _read(path)
+    if 'id="bulk-export-modal"' in src:
+        print("  index.html already patched")
+        return False
+    marker = '<div class="toast-host" id="toast-host"></div>'
+    if marker not in src:
+        print(f"  ERROR: toast-host marker not found in index.html")
+        return False
+    src = src.replace(marker, INDEX_NEW_MODAL + "\n" + marker, 1)
+    _write(path, src)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# 4. static/js/app.js - rewrite to match actual HTML IDs
+# ---------------------------------------------------------------------------
+NEW_APP_JS_HEAD = "/* AI Data Intelligence Platform - frontend logic (v4)\n"
+NEW_APP_JS_MARKER = "Matches the exact modal/element IDs in templates/index.html"
+
+
+def patch_app_js() -> bool:
+    path = ROOT / "static" / "js" / "app.js"
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(NEW_APP_JS_HEAD, encoding="utf-8")
+    src = _read(path)
+    if NEW_APP_JS_MARKER in src:
+        print("  app.js already patched (v4)")
+        return False
+    # We embed the new JS via _write from disk - read full content from sibling
+    full = ROOT / "static" / "js" / "app.v4.js"
+    if not full.exists():
+        # Write our embedded NEW_APP_JS there for transparency, then move
+        full.write_text(NEW_APP_JS_BODY, encoding="utf-8")
+    content = NEW_APP_JS_HEAD + " * " + NEW_APP_JS_MARKER + "\n */\n" + NEW_APP_JS_BODY
+    _write(path, content)
+    return True
+
+
+NEW_APP_JS_BODY = r'''
 const API = {
   preview: '/api/preview',
   runs: '/api/runs',
@@ -1143,3 +1809,25 @@ function refreshWebhooks() {
     });
   }).catch(() => {});
 }
+'''
+
+
+def main() -> int:
+    print(f"Patching project at: {ROOT}")
+    print("=" * 60)
+    print("[1/4] Patching database.py ...")
+    patch_database()
+    print("[2/4] Patching app.py ...")
+    patch_app()
+    print("[3/4] Patching templates/index.html ...")
+    patch_index()
+    print("[4/4] Rewriting static/js/app.js ...")
+    patch_app_js()
+    print("=" * 60)
+    print("DONE. Backups saved with .bak extension next to each file.")
+    print("Restart Flask (Ctrl+C then 'python app.py') and hard-refresh browser.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
